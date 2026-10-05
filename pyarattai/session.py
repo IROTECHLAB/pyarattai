@@ -68,24 +68,25 @@ class Session:
             value = item.get("value")
             if not name or value is None:
                 continue
-            # Force every cookie onto .arattai.in. Arattai's ZGS edge
-            # expects the whole cookie set on every chat request, and
-            # cookies scoped to accounts.arattai.in are NOT sent to
-            # web.arattai.in by requests. The reference client flattens
-            # domains the same way.
+            # Preserve the domain that the server originally set.
+            # Sending iamcsr to web.arattai.in/_wms/* causes the WMS
+            # endpoint to reject the request and skip minting
+            # x-tkp-token, so we must not flatten scoped cookies.
+            raw_domain = item.get("domain") or domain
+            domain_str = str(raw_domain)
             c = Cookie(
                 version=0,
                 name=str(name),
                 value=str(value),
                 port=None,
                 port_specified=False,
-                domain=".arattai.in",
-                domain_specified=True,
-                domain_initial_dot=True,
-                path="/",
+                domain=domain_str,
+                domain_specified=bool(domain_str),
+                domain_initial_dot=domain_str.startswith("."),
+                path=item.get("path") or "/",
                 path_specified=True,
-                secure=True,
-                expires=None,
+                secure=bool(item.get("secure", True)),
+                expires=item.get("expires"),
                 discard=False,
                 comment=None,
                 comment_url=None,

@@ -64,40 +64,10 @@ class Message:
     # ------------------------------------------------------------- actions
 
     def reply(self, text: str) -> "Message":
-        """Reply to this message's chat.
-
-        Uses E2EE send when the incoming frame was encrypted, otherwise
-        falls back to the plaintext endpoint.
-        """
+        """Reply to this message's chat."""
         if not self.chat_id:
             raise ArattaiError("Message has no chat_id; cannot reply")
-
-        client = self._bot.client
-
-        # Was this Message from an E2EE frame?
-        meta = {}
-        try:
-            meta = self._raw.meta if hasattr(self._raw, "meta") else {}
-        except Exception:
-            pass
-        is_e2ee = isinstance(meta, dict) and (
-            meta.get("enc") or meta.get("_decrypted")
-        )
-
-        if is_e2ee and self.sender and client.uid:
-            from .signal import SignalBridge
-            sid = getattr(self._bot, "_ws_sid", None) or client.session_id
-            bridge = SignalBridge(uid=client.uid)
-            bridge.send(
-                client, self.chat_id, self.sender, text, sid=sid,
-            )
-            return Message(self._bot, _RawMessage.from_api({
-                "msg": text, "msgid": "e2ee-sent",
-                "msguid": "e2ee-sent",
-                "chid": self.chat_id, "sender": client.uid,
-            }))
-
-        sent = client.send(self.chat_id, text)
+        sent = self._bot.client.send(self.chat_id, text)
         return Message(self._bot, sent)
 
     def react(self, emoji: str) -> Any:
@@ -152,21 +122,11 @@ class ArattaiBot:
         poll_interval: float = 15.0,
         e2ee_daemon: bool = False,
         db_path: Optional[str] = BOT_DB_FILE,
-        watch_chats: Optional[List[str]] = None,
-        transport: str = "http",
     ) -> None:
         self.phone = phone
         self.session_file = os.path.expanduser(session_file)
         self.poll_interval = poll_interval
         self.e2ee_daemon = e2ee_daemon
-        self.watch_chats = watch_chats
-        self.transport = transport
-        self._ws = None
-        self._ws_sid = None
-        self._running = False
-        self.watch_chats = watch_chats
-        self.transport = transport
-        self._ws = None  # populated when transport == "ws"
         self._db_path = os.path.expanduser(db_path) if db_path else None
         self._db: Optional[sqlite3.Connection] = None
 
@@ -287,16 +247,11 @@ class ArattaiBot:
         if msg.is_command:
             handler = self._command_handlers.get(msg.command)
             if handler is not None:
-                try:
-                    handler.handler_fn(msg)
-                except Exception as e:
-                    print(f"[pyarattai] command error: {e!r}")
-                    import traceback
-                    traceback.print_exc()
+                handler.handler_fn(msg)
         for fn in self._message_handlers:
             try:
                 fn(msg)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"[pyarattai] handler error: {e!r}")
 
     # ------------------------------------------------------------- run loop
@@ -344,13 +299,11 @@ class ArattaiBot:
                 self._dispatch(wrapped)
 
     def run(self, single: bool = False) -> None:
-        """Blocking run loop. Uses ``self.transport`` ("http" or "ws")."""
-        if self.transport == "ws":
-            self._run_ws(single=single)
-        else:
-            self._run_http(single=single)
+        """Blocking poll loop.
 
-    def _run_http(self, single: bool = False) -> None:
+        Args:
+            single: If True, run one poll and return.
+        """
         self._running = True
         backoff = 1.0
         while self._running:
@@ -369,118 +322,6 @@ class ArattaiBot:
                 break
             time.sleep(self.poll_interval)
 
-    def _run_ws(self, single: bool = False) -> None:
-        from .ws import WSClient
-        from .models import Message as _RM
-
-        uid = self.client.uid or "0"
-        ws = WSClient(self.client.s, uid=uid, dname=self.client.mobile or "bot")
-        self._ws = ws
-
-        def on_sid(sid: str) -> None:
-            self.client.session_id = sid
-            self._ws_sid = sid
-            print(f"[pyarattai] X-SID captured ({len(sid)} chars)")
-            try:
-                import json as _json
-                sf = os.path.expanduser(self.session_file)
-                blob = _json.loads(open(sf).read())
-                blob["session_id"] = sid
-                open(sf, "w").write(_json.dumps(blob, indent=2))
-                os.chmod(sf, 0o600)
-            except Exception:
-                pass
-            # Persist so other processes (CLI, bridge.send) can use it.
-            try:
-                import json as _json
-                sf = os.path.expanduser(self.session_file)
-                blob = _json.loads(open(sf).read())
-                blob["session_id"] = sid
-                open(sf, "w").write(_json.dumps(blob, indent=2))
-                os.chmod(sf, 0o600)
-            except Exception as e:
-                print(f"[pyarattai] failed to persist SID: {e}")
-
-        def on_frame(fr: dict) -> None:
-            mt = fr.get("mtype")
-            if mt == "0":
-                print("[pyarattai] ws handshake OK")
-
-        def on_msg(msg: dict) -> None:
-            sender = msg.get("sender")
-            if sender and self.client.uid and str(sender) == str(self.client.uid):
-                return
-            chid = msg.get("chid") or msg.get("chat_id") or ""
-            if not chid:
-                return
-
-            # Auto-decrypt E2EE frames before dispatching to handlers.
-            meta = msg.get("meta")
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = {}
-            if isinstance(meta, dict) and meta.get("enc") and self.client.uid:
-                try:
-                    from .signal import SignalBridge
-                    bridge = SignalBridge(uid=self.client.uid)
-                    plaintext = bridge.decrypt(msg)
-                    msg = dict(msg)
-                    msg["msg"] = plaintext
-                    meta = dict(meta)
-                    meta["_decrypted"] = True
-                    msg["meta"] = meta
-                    print(f"[pyarattai] decrypted msg from "
-                          f"{msg.get('dname')}: {plaintext[:60]}")
-                except Exception as e:
-                    print(f"[pyarattai] decrypt failed: {e}")
-
-            payload = dict(msg)
-            payload["chid"] = chid
-            raw = _RM.from_api(payload)
-            try:
-                self._persist(chid, raw)
-            except Exception:
-                pass
-            wrapped = Message(self, raw)
-            wrapped.chat_id = chid
-            try:
-                self._dispatch(wrapped)
-            except Exception as e:
-                print(f"[pyarattai] dispatch error: {e!r}")
-        ws.on_sid(on_sid)
-        ws.on_frame(on_frame)
-        ws.on_message(on_msg)
-
-        print("[pyarattai] starting WebSocket transport")
-        ws.start(blocking=False)
-        self._running = True
-
-        if single:
-            print("[pyarattai] single-shot: 5s listening")
-            time.sleep(5.0)
-            ws.stop()
-            self._running = False
-            return
-
-        try:
-            while self._running:
-                time.sleep(1.0)
-                if ws._thread is not None and not ws._thread.is_alive():
-                    print("[pyarattai] ws thread died; exiting")
-                    break
-        except KeyboardInterrupt:
-            pass
-        finally:
-            ws.stop()
-            self._running = False
-
     def stop(self) -> None:
-        """Stop the loop (and WS if running)."""
+        """Stop the blocking loop at the next iteration."""
         self._running = False
-        if self._ws is not None:
-            try:
-                self._ws.stop()
-            except Exception:
-                pass

@@ -9,6 +9,7 @@ from .auth import Auth
 from .constants import SESSION_FILE
 from .errors import AuthError
 from .models import Chat, Message
+from .signal import SignalBridge
 from .session import Session
 
 __all__ = ["ArattaiClient"]
@@ -55,7 +56,20 @@ class ArattaiClient:
         code = input("Enter 6-digit OTP: ").strip()
         a.verify_otp(code)
         a.mobile = phone
+
+        # Do the chat handshake, mint x-tkp-token, then pull uid and
+        # (if present) e2ee_device_id from /webclientsync.do before
+        # saving — otherwise the file ends up with uid=None.
+        a.establish_chat_session()
+        a.mint_x_tkp_token()
         a.fetch_session_meta()
+
+        # If webclientsync did not yield a uid, fall back to the
+        # identifier returned by the accounts lookup (they are the
+        # same value).
+        if not a.uid:
+            a.uid = a.identifier
+
         a.save(session_file)
         blob = {
             "uid": a.uid, "mobile": a.mobile,
@@ -159,7 +173,16 @@ class ArattaiClient:
                 continue
             if m.get("msg") == "chat.more":
                 continue
-            msgs.append(Message.from_api(m))
+            msg = Message.from_api(m)
+            if msg.is_encrypted and self.uid:
+                try:
+                    bridge = SignalBridge(uid=self.uid)
+                    msg.text = bridge.decrypt(m)
+                except Exception as e:
+                    import logging
+                    logging.getLogger("pyarattai").debug(
+                        "auto-decrypt failed: %s", e)
+            msgs.append(msg)
         return msgs
     def send(self, chat_id: str, text: str) -> Message:
         """Send a plaintext message."""

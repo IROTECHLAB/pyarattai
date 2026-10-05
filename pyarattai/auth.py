@@ -227,7 +227,12 @@ class Auth:
         from .constants import CHAT_BASE as _CB
 
         uid = self.uid or "0"
-        tabid = f"{uid}_CT_{int(time.time()*1000)}_{1000 + _sec.randbelow(8999)}"
+        # Reuse the same tabid within a session — the browser keeps it
+        # stable for the entire lifetime and the WMS endpoint may treat
+        # a fresh tabid as a new device (skipping x-tkp-token issuance).
+        if not getattr(self, "_tabid", None):
+            self._tabid = f"{uid}_CT_{int(time.time()*1000)}_{1000 + _sec.randbelow(8999)}"
+        tabid = self._tabid
         params = "&".join([
             "settings=true", "prd=CT", f"uname={uid}", "samedomain=false",
             f"nocache={int(time.time()*1000)}", "config=111", "wmscont=_wms",
@@ -303,8 +308,9 @@ class Auth:
             self.uid = (self.s._find_cookie("zuid")
                         or self.s._find_cookie("uid"))
 
-        # Mint WS token so wss:// connections are authorized.
-        self.mint_x_tkp_token()
+        # Mint WS token only if we don't already have one.
+        if not self.s._find_cookie("x-tkp-token"):
+            self.mint_x_tkp_token()
 
     # ------------------------------------------------------------------ persistence
 
