@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "irotechlab-pyarattai"
+version = "0.1.0"
+description = "Arattai client + bot framework"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "IROTECHLAB" }]
+keywords = ["arattai", "bot", "chat", "telegram-like"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = ["requests>=2.31", "websocket-client>=1.6"]
+
+[project.optional-dependencies]
+daemon = []
+# Termux-safe: only pure-Python / wheel-available packages.
+# ruff, mypy, twine are installed separately (see README / pkg install).
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "build>=1.2",
+]
+
+[project.scripts]
+pyarattai = "pyarattai.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/IROTECHLAB/pyarattai"
+Source = "https://github.com/IROTECHLAB/pyarattai"
+
+[tool.setuptools.packages.find]
+include = ["pyarattai*"]
+
+[tool.setuptools.package-data]
+pyarattai = ["daemon/*.cjs", "daemon/*.js"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
