@@ -1,14 +1,100 @@
+# Python
 __pycache__/
 *.py[cod]
-*.egg-info/
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
 .venv/
+venv/
+ENV/
+env/
 .venv*/
+env.bak/
+venv.bak/
+
+# Testing / coverage
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
+.tox/
+.nox/
 .coverage
+.coverage.*
 htmlcov/
-*.db
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checking / linting caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# pyarattai runtime state
 session.json
+signal-storage.json
+bot.db
+*.db
+.inbox.jsonl
+.js-server.cjs
+.keygen.cjs
+.decrypt.cjs
+.send.cjs
+.ws-sid.json
+.ws-rsa.json
+.ws-url.json
+bad_frame.json
+latest_frame.json
+
+# Node
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+cookie-header.txt
+
+# temp
+*.tmp
+*.bak
+*.log

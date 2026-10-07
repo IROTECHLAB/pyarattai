@@ -78,6 +78,54 @@ class Chat:
             raw=data,
         )
 
+    @property
+    def is_group(self) -> bool:
+        """True if this is a group chat (chid ends with -GC)."""
+        return str(self.id or "").endswith("-GC")
+
+    @property
+    def is_e2ee(self) -> bool:
+        """True if the chat is E2EE.
+
+        Signals used by Arattai (any one is sufficient):
+
+        * explicit ``e2ee: true`` field
+        * ``addinfo`` contains ``E2EE:1``
+        * ``last_message.meta.enc`` is true
+        * ``type == "dm"``
+        * ``chat_type == 1``
+        * chat-id has no known non-E2EE suffix
+        """
+        raw = self.raw or {}
+
+        # explicit
+        if raw.get("e2ee") is True:
+            return True
+
+        # addinfo marker
+        info = str(raw.get("addinfo") or "")
+        if ":E2EE:1" in info or "E2EE:1" in info:
+            return True
+
+        # last message encrypted
+        lm = self.last_message
+        if isinstance(lm, dict):
+            m = lm.get("meta")
+            if isinstance(m, dict) and m.get("enc"):
+                return True
+
+        # type / chat_type markers
+        if raw.get("type") == "dm":
+            return True
+        if raw.get("chat_type") == 1:
+            return True
+
+        # chid shape fallback
+        chid = str(self.id or "")
+        for suffix in ("-GC", "-SM", "-SC", "-PC"):
+            if chid.endswith(suffix):
+                return False
+        return bool(chid)
 
 @dataclass
 class Message:

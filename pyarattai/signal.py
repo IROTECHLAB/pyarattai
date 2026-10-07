@@ -21,6 +21,8 @@ Rules
 """
 from __future__ import annotations
 
+import os
+
 import json
 import logging
 import os
@@ -48,6 +50,7 @@ log = logging.getLogger("pyarattai.signal")
 
 HOME = Path(os.path.expanduser("~"))
 PROJ = HOME / ".pyarattai"
+VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
 NODE_MODS = PROJ / "node_modules"
 SIGNAL_FILE = PROJ / "signal-storage.json"
 LIBSIGNAL_VENDORED = (HOME / "arattai-js" / "vendor-libsignal"
@@ -63,505 +66,67 @@ MARK_SEND = "PYA_SEND\x00"
 MARK_KEYGEN = "PYA_KEYGEN\x00"
 
 # ---------------------------------------------------------------------------
-# shared JS preamble (bootstrap + store class)
+# vendor loading
 # ---------------------------------------------------------------------------
 
-_BOOTSTRAP = r'''
-'use strict';
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
+VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
 
-(function () {
-  const setG = (n, v) => { try {
-    Object.defineProperty(globalThis, n,
-      { value: v, writable: true, configurable: true, enumerable: false });
-  } catch { try { globalThis[n] = v; } catch {} } };
-  setG('window', globalThis);
-  setG('self', globalThis);
-  if (!globalThis.navigator) setG('navigator', { userAgent: 'node' });
 
-  const el = () => ({
-    tagName: 'x', nodeType: 1, style: {}, attributes: {},
-    children: [], childNodes: [],
-    body: { appendChild(){} }, head: { appendChild(){} },
-    setAttribute(){}, getAttribute(){ return null; },
-    hasAttribute(){ return false; },
-    appendChild(c){ return c; }, removeChild(c){ return c; },
-    cloneNode(){ return el(); },
-    addEventListener(){}, removeEventListener(){},
-    querySelector(){ return null; }, querySelectorAll(){ return []; },
-    getElementsByTagName(){ return []; },
-    toDataURL(){ return 'data:,'; },
-    getContext(){ return new Proxy({}, { get: () => () => {}, set: () => true }); },
-    createTextNode(t){ return { nodeType: 3, textContent: t }; },
-  });
-  const doc = {
-    nodeType: 9, createElement: el, createTextNode: el,
-    createDocumentFragment: el,
-    createNodeIterator: () => ({ nextNode: () => null }),
-    getElementsByTagName: () => [], querySelector: () => null,
-    querySelectorAll: () => [],
-    addEventListener(){}, removeEventListener(){},
-    currentScript: null,
-    baseURI: 'https://web.arattai.in/', cookie: '',
-    body: el(), head: el(), documentElement: el(),
-    implementation: { createHTMLDocument: () => doc },
-  };
-  doc.ownerDocument = doc;
-  setG('document', doc);
-  setG('location', {
-    href: 'https://web.arattai.in/', origin: 'https://web.arattai.in',
-    pathname: '/', protocol: 'https:', host: 'web.arattai.in',
-  });
-  if (!globalThis.screen) setG('screen', { width: 1080, height: 1920 });
-  if (!globalThis.performance) setG('performance', { now: () => Date.now() });
-  if (!globalThis.addEventListener) setG('addEventListener', () => {});
-  if (!globalThis.removeEventListener) setG('removeEventListener', () => {});
-  if (!globalThis.MutationObserver) setG('MutationObserver',
-    class { observe(){} disconnect(){} takeRecords(){ return []; } });
+def _vendor(name: str) -> str:
+    """Read a file from the packaged ``vendor/`` directory."""
+    p = VENDOR_DIR / name
+    if not p.exists():
+        raise ArattaiError(
+            f"pyarattai install is missing {name!r}; reinstall the package"
+        )
+    return p.read_text()
 
-  // resolve deps from ~/.pyarattai/node_modules
-  const PROJ = path.join(os.homedir(), '.pyarattai');
-  const Module = require('module');
-  const orig = Module._resolveFilename;
-  Module._resolveFilename = function (req, ...a) {
-    if (['bytebuffer', 'long', 'protobufjs'].includes(req))
-      return orig.call(this, path.join(PROJ, 'node_modules', req), ...a);
-    return orig.call(this, req, ...a);
-  };
 
-  const BB = require('bytebuffer');
-  const Long = require('long');
-  const protobuf = require('protobufjs');
-  const BBClass = BB.ByteBuffer || BB;
-  BBClass.Long = Long;
+def _vendor_path(name: str) -> Path:
+    p = VENDOR_DIR / name
+    if not p.exists():
+        raise ArattaiError(
+            f"pyarattai install is missing {name!r}; reinstall the package"
+        )
+    return p
 
-  const ProtoBuf = protobuf.ProtoBuf || protobuf;
-  if (!ProtoBuf.loadProto && protobuf.loadProto)
-    ProtoBuf.loadProto = protobuf.loadProto;
-  if (!protobuf.ProtoBuf) protobuf.ProtoBuf = ProtoBuf;
-
-  setG('ByteBuffer', BBClass);
-  setG('Long', Long);
-  setG('protobuf', protobuf);
-  setG('dcodeIO', {
-    ByteBuffer: BBClass, Long,
-    protobuf, ProtoBuf,
-  });
-})();
-
-const LIB = process.env.LIBSIGNAL_PATH;
-if (!LIB || !fs.existsSync(LIB)) {
-  console.error('no libsignal at ' + LIB); process.exit(2);
-}
-let libsignal;
-try {
-  const required = require(LIB);
-  libsignal = globalThis.libsignal || globalThis.Signal ||
-             (required && required.default) || required;
-} catch (e) {
-  console.error('libsignal load failed: ' + e.message); process.exit(2);
-}
-if (!libsignal || !libsignal.Curve) {
-  console.error('libsignal has no Curve; keys=' +
-    Object.keys(libsignal || {}).join(','));
-  process.exit(3);
-}
-
-// libsignal throws from inside its own .then chains for malformed
-// ciphertext. Node 26 exits on unhandled rejections, so install a
-// global handler that swallows them. The individual operation code
-// checks the return value / catches to decide success or failure.
-process.on('unhandledRejection', (e) => {
-  // no-op: we already track the error via safeTry's resolve
-});
-process.on('uncaughtException', (e) => {
-  // no-op: same reason
-});
-'''
-
-_STORE = r'''
-function b64buf(b64) {
-  const b = Buffer.from(b64, 'base64');
-  const u = new Uint8Array(b.length);
-  u.set(b);
-  return u.buffer;
-}
-function bufb64(v) {
-  if (v == null) return null;
-  if (Buffer.isBuffer(v)) return v.toString('base64');
-  return Buffer.from(new Uint8Array(v)).toString('base64');
-}
-
-class PersistentStore {
-  constructor(jsonPath) {
-    this.path = jsonPath;
-    const raw = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-    this._sessions = new Map();
-    for (const s of raw.sessions || []) this._sessions.set(s.id, s.session);
-    this._preKeys = new Map();
-    for (const k of raw.pre_keys || [])
-      this._preKeys.set(Number(k.tag), { pub: k.pub, priv: k.priv });
-    this._signedPreKeys = new Map();
-    for (const k of raw.signed_pre_keys || [])
-      this._signedPreKeys.set(Number(k.tag), k);
-    this._identityKey = raw.identityKey || null;
-    this._registrationId = raw.registrationId || 0;
-    this.Direction = { SENDING: 0, RECEIVING: 1 };
-  }
-
-  persist() {
-    const out = {
-      identityKey: this._identityKey,
-      registrationId: this._registrationId,
-      signed_pre_keys: [...this._signedPreKeys.values()],
-      pre_keys: [...this._preKeys.entries()].map(([tag, k]) => ({
-        tag, pub: k.pub, priv: k.priv,
-      })),
-      sessions: [...this._sessions.entries()].map(([id, session]) => ({
-        id, session,
-      })),
-      sender_keys: [], aes_keys: [],
-    };
-    const tmp = this.path + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
-    fs.renameSync(tmp, this.path);
-  }
-
-  async loadSession(a){ return this._sessions.get(a); }
-  async storeSession(a, r){ this._sessions.set(a, r); this.persist(); }
-  async removeSession(a){ this._sessions.delete(a); this.persist(); }
-  async removeAllSessions(a){ this._sessions.delete(a); this.persist(); }
-  async loadPreKey(id){
-    const k = this._preKeys.get(Number(id));
-    if (!k) return undefined;
-    return { pubKey: b64buf(k.pub), privKey: b64buf(k.priv) };
-  }
-  async storePreKey(id, r){
-    this._preKeys.set(Number(id),
-      { pub: bufb64(r.pubKey), priv: bufb64(r.privKey) });
-    this.persist();
-  }
-  async removePreKey(id){ this._preKeys.delete(Number(id)); this.persist(); }
-  async loadSignedPreKey(id){
-    const k = this._signedPreKeys.get(Number(id));
-    if (!k) return undefined;
-    return {
-      pubKey: b64buf(k.pub), privKey: b64buf(k.priv),
-      signature: b64buf(k.sign),
-    };
-  }
-  async loadSignedPreKeys(){
-    const out = [];
-    for (const [id, rec] of this._signedPreKeys) out.push({ id, ...rec });
-    return out;
-  }
-  async storeSignedPreKey(id, r){
-    this._signedPreKeys.set(Number(id), {
-      tag: Number(id), is_default: true,
-      pub: bufb64(r.pubKey), priv: bufb64(r.privKey),
-      sign: bufb64(r.signature), time: Date.now(),
-    });
-    this.persist();
-  }
-  async removeSignedPreKey(id){
-    this._signedPreKeys.delete(Number(id)); this.persist();
-  }
-  async getIdentityKeyPair(){
-    if (!this._identityKey) throw new Error('no identity');
-    return {
-      pubKey: b64buf(this._identityKey.pub),
-      privKey: b64buf(this._identityKey.priv),
-    };
-  }
-  async getLocalRegistrationId(){ return this._registrationId; }
-  async isTrustedIdentity(){ return true; }
-  async saveIdentity(){ return false; }
-  async loadIdentityKey(){ return null; }
-}
-'''
-
-# ---------------------------------------------------------------------------
-# keygen
-# ---------------------------------------------------------------------------
-
-_KEYGEN = _BOOTSTRAP + r'''
-const toB64 = v => {
-  if (v == null) throw new Error('null key');
-  if (typeof v === 'string') return v;
-  if (Buffer.isBuffer(v)) return v.toString('base64');
-  if (v instanceof Uint8Array) return Buffer.from(v).toString('base64');
-  if (v instanceof ArrayBuffer) return Buffer.from(new Uint8Array(v)).toString('base64');
-  if (ArrayBuffer.isView(v))
-    return Buffer.from(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)).toString('base64');
-  if (v.data) return toB64(v.data);
-  if (Array.isArray(v)) return Buffer.from(v).toString('base64');
-  if (v.buffer && v.byteLength != null) return toB64(v.buffer);
-  throw new Error('unknown key shape: ' + Object.prototype.toString.call(v));
-};
-
-(async () => {
-  const outPath = process.argv[2];
-  const deviceId = process.argv[3];
-  const Curve = libsignal.Curve;
-  const KeyHelper = libsignal.KeyHelper;
-  if (!Curve || !KeyHelper) {
-    console.error('libsignal missing Curve/KeyHelper'); process.exit(3);
-  }
-
-  const idKp = Curve.generateKeyPair();
-  const regId = Math.floor(Math.random() * 16380) + 1;
-  const maybe = v => (v && typeof v.then === 'function') ? v : Promise.resolve(v);
-
-  const preKeys = [];
-  for (let tag = 1; tag <= 100; tag++)
-    preKeys.push(await maybe(KeyHelper.generatePreKey(tag)));
-  const spk = await maybe(KeyHelper.generateSignedPreKey(idKp, 1));
-
-  const state = {
-    identityKey: { priv: toB64(idKp.privKey), pub: toB64(idKp.pubKey) },
-    registrationId: regId,
-    signed_pre_keys: [{
-      tag: spk.keyId || 1, is_default: true,
-      pub: toB64(spk.keyPair.pubKey), priv: toB64(spk.keyPair.privKey),
-      sign: Buffer.from(spk.signature).toString('base64'),
-      time: Date.now(),
-    }],
-    pre_keys: preKeys.map(pk => ({
-      tag: pk.keyId,
-      pub: toB64(pk.keyPair.pubKey),
-      priv: toB64(pk.keyPair.privKey),
-    })),
-    sessions: [], sender_keys: [], aes_keys: [],
-  };
-  fs.writeFileSync(outPath, JSON.stringify(state, null, 2));
-
-  const body = { data: {
-    registration_id: regId,
-    device_id: parseInt(deviceId, 10),
-    identity_key: { tag: 0, pub: state.identityKey.pub },
-    signed_prekey: {
-      tag: state.signed_pre_keys[0].tag,
-      pub: state.signed_pre_keys[0].pub,
-      sign: state.signed_pre_keys[0].sign,
-    },
-    onetime_prekeys: preKeys.map(pk => ({
-      tag: pk.keyId, pub: toB64(pk.keyPair.pubKey),
-    })),
-  }};
-  process.stdout.write('PYA_KEYGEN\x00' + JSON.stringify(body));
-})().catch(e => {
-  console.error('keygen failed: ' + (e.stack || e.message));
-  process.exit(1);
-});
-'''
-
-# ---------------------------------------------------------------------------
-# decrypt
-# ---------------------------------------------------------------------------
-
-_DECRYPT = _BOOTSTRAP + _STORE + r'''
-function safeTry(fn) {
-  return new Promise(resolve => {
-    try {
-      const r = fn();
-      if (r && typeof r.then === 'function') {
-        r.then(b => resolve({ ok: true, bytes: Buffer.from(b) }),
-               e => resolve({ ok: false, err: String(e.message || e) }));
-      } else {
-        resolve({ ok: true, bytes: Buffer.from(r) });
-      }
-    } catch (e) {
-      resolve({ ok: false, err: String(e.message || e) });
-    }
-  });
-}
-
-function allOurKeys(encKeys, MY_UID) {
-  const out = [];
-  for (const k of Object.keys(encKeys)) {
-    if (!/^\d+_\d+_\d+$/.test(k)) continue;
-    if (k.split('_')[0] === MY_UID) out.push({ label: k, b64: encKeys[k] });
-  }
-  return out;
-}
-
-async function decrypt(storagePath, MY_UID, frame) {
-  const { SessionCipher, SignalProtocolAddress } = libsignal;
-  const m = (frame.msg && typeof frame.msg === 'object') ? frame.msg : frame;
-  let meta = typeof m.meta === 'string' ? JSON.parse(m.meta) : (m.meta || {});
-
-  let encKeys = null;
-  let ek = meta.enc_keys;
-  if (typeof ek === 'string') { try { ek = JSON.parse(ek); } catch {} }
-  if (ek && typeof ek === 'object' &&
-      Object.keys(ek).some(k => /^\d+_\d+_\d+$/.test(k))) {
-    encKeys = ek;
-  }
-  if (!encKeys) throw new Error('no enc_keys');
-
-  const ourKeys = allOurKeys(encKeys, MY_UID);
-  if (ourKeys.length === 0) throw new Error(
-    'no wrapped key for uid ' + MY_UID +
-    '; labels=' + Object.keys(encKeys).join(','));
-
-  const sd = encKeys.source_device_id;
-  if (sd == null) throw new Error('no source_device_id');
-  const ss = String(sd);
-  let senderDev;
-  if (/^\d+_\d+_\d+$/.test(ss)) senderDev = ss.split('_')[2];
-  else if (/^\d+_\d+$/.test(ss)) senderDev = ss.split('_')[1];
-  else senderDev = ss;
-
-  const senderUid = String(m.sender);
-
-  let keyBytes = null;
-  const errors = [];
-  for (const ourKey of ourKeys) {
-    const store = new PersistentStore(storagePath);
-    const addr = new SignalProtocolAddress(senderUid, Number(senderDev));
-    const cipher = new SessionCipher(store, addr);
-
-    const r1 = await safeTry(() => cipher.decryptPreKeyWhisperMessage(ourKey.b64, 'base64'));
-    if (r1.ok) { keyBytes = r1.bytes; break; }
-
-    const r2 = await safeTry(() => cipher.decryptWhisperMessage(ourKey.b64, 'base64'));
-    if (r2.ok) { keyBytes = r2.bytes; break; }
-
-    errors.push(ourKey.label + ': prekey=' + r1.err + ' | whisper=' + r2.err);
-  }
-  if (!keyBytes) throw new Error('all our keys failed: ' + errors.join(' || '));
-
-  const parts = String(m.msg || '').split('$');
-  if (parts.length !== 2) throw new Error('body not iv$ct');
-  const iv = Buffer.from(parts[0], 'base64');
-  const ct = Buffer.from(parts[1], 'base64');
-  const cw = require('crypto').webcrypto;
-  const aesKey = await cw.subtle.importKey('raw', keyBytes,
-    { name: 'AES-GCM' }, false, ['decrypt']);
-  const pt = await cw.subtle.decrypt(
-    { name: 'AES-GCM', iv, tagLength: 128 }, aesKey, ct);
-  return Buffer.from(pt).toString('utf8');
-}
-
-(async () => {
-  const storagePath = process.argv[2];
-  const MY_UID = process.env.MY_UID || process.argv[3];
-  const frame = JSON.parse(fs.readFileSync(0, 'utf8'));
-  try {
-    const plain = await decrypt(storagePath, MY_UID, frame);
-    process.stdout.write('PYA_DECRYPT\x00' + plain);
-  } catch (e) {
-    console.error('ERR: ' + (e.message || e));
-    process.exit(1);
-  }
-})();
-'''
-
-# ---------------------------------------------------------------------------
-# send
-# ---------------------------------------------------------------------------
-
-_SEND = _BOOTSTRAP + _STORE + r'''
-function bodyToB64(body) {
-  // libsignal-protocol-javascript returns enc.body as a binary string
-  // (each char 0-255). We must use latin1, not utf8, to preserve bytes.
-  if (typeof body === 'string') {
-    return Buffer.from(body, 'binary').toString('base64');
-  }
-  return Buffer.from(new Uint8Array(body)).toString('base64');
-}
-
-async function encrypt(storagePath, MY_DEVICE_ID, text, bundles) {
-  const { SessionBuilder, SessionCipher, SignalProtocolAddress } = libsignal;
-  const store = new PersistentStore(storagePath);
-  const cw = require('crypto').webcrypto;
-
-  // 1. Random AES-256 key + 12-byte IV for the message body
-  const aesKeyRaw = cw.getRandomValues(new Uint8Array(32));
-  const iv = cw.getRandomValues(new Uint8Array(12));
-  const aesKey = await cw.subtle.importKey('raw', aesKeyRaw,
-    { name: 'AES-GCM' }, false, ['encrypt']);
-  const ct = new Uint8Array(await cw.subtle.encrypt(
-    { name: 'AES-GCM', iv, tagLength: 128 },
-    aesKey, new TextEncoder().encode(text)));
-  const bodyB64 = Buffer.from(iv).toString('base64') + '$'
-                + Buffer.from(ct).toString('base64');
-
-  // 2. Wrap the AES key for each recipient device.
-  //    Always rebuild sessions from fresh bundles — Signal's session
-  //    ratchet can drift if we reuse an old cached one and then the
-  //    recipient shows "Waiting for this message".
-  const encKeys = {};
-  for (const b of bundles) {
-    const addr = new SignalProtocolAddress(b.user_id, Number(b.device_id));
-    const builder = new SessionBuilder(store, addr);
-    await builder.processPreKey({
-      registrationId: b.registration_id,
-      identityKey: b64buf(b.identity_key.pub),
-      signedPreKey: {
-        keyId: b.signed_prekey.tag,
-        publicKey: b64buf(b.signed_prekey.pub),
-        signature: b64buf(b.signed_prekey.sign),
-      },
-      preKey: {
-        keyId: b.onetime_prekey.tag,
-        publicKey: b64buf(b.onetime_prekey.pub),
-      },
-    });
-    const cipher = new SessionCipher(store, addr);
-    const enc = await cipher.encrypt(aesKeyRaw.buffer);
-    const key = `${b.user_id}_${b.registration_id}_${b.device_id}`;
-    encKeys[key] = bodyToB64(enc.body);
-  }
-  encKeys.source_device_id = String(MY_DEVICE_ID);
-  return { msg: bodyB64, enc_keys: encKeys };
-}
-
-(async () => {
-  const storagePath = process.argv[2];
-  const MY_DEVICE_ID = process.env.MY_DEVICE_ID;
-  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-  try {
-    const result = await encrypt(storagePath, MY_DEVICE_ID,
-                                 input.text, input.bundles);
-    process.stdout.write('PYA_SEND\x00' + JSON.stringify(result));
-  } catch (e) {
-    console.error('ERR: ' + (e.stack || e.message));
-    process.exit(1);
-  }
-})();
-'''
 
 # ---------------------------------------------------------------------------
 # write helpers
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def install_signal_helpers(force: bool = False) -> None:
-    """Write all Node helper scripts to ``~/.pyarattai/``."""
+    """Copy the vendored Node scripts into ``~/.pyarattai/``.
+
+    On first run this also copies ``libsignal-protocol.js``.
+    """
     PROJ.mkdir(parents=True, exist_ok=True)
-    for path, src in [
-        (KEYGEN_JS, _KEYGEN),
-        (DECRYPT_JS, _DECRYPT),
-        (SEND_JS, _SEND),
-    ]:
-        if force or not path.exists():
-            path.write_text(src)
+    for name in ("libsignal-protocol.js", "keygen.cjs", "decrypt.cjs", "send.cjs"):
+        dest = PROJ / name if name.endswith(".js") else PROJ / ("." + name)
+        src = VENDOR_DIR / name
+        if not src.exists():
+            raise ArattaiError(
+                f"pyarattai package missing vendor/{name}; reinstall it"
+            )
+        if force or not dest.exists():
+            dest.write_text(src.read_text())
 
-
-# ---------------------------------------------------------------------------
-# environment
-# ---------------------------------------------------------------------------
 
 def ensure_libsignal() -> Path:
-    """Return the path to a working libsignal bundle."""
-    for c in (LIBSIGNAL_VENDORED, LIBSIGNAL_WEB):
+    """Return path to a working libsignal JS bundle.
+
+    Order:
+      1. ~/.pyarattai/libsignal-protocol.js (copied on install)
+      2. bundled vendor/libsignal-protocol.js
+    """
+    install_signal_helpers()
+    for c in [PROJ / "libsignal-protocol.js",
+              VENDOR_DIR / "libsignal-protocol.js"]:
         if c.exists():
             return c
     raise ArattaiError(
-        "libsignal bundle not found. Place libsignal-protocol.js at "
-        f"{LIBSIGNAL_VENDORED} or libsignal-min.js at {LIBSIGNAL_WEB}."
+        "libsignal bundle missing; reinstall irotechlab-pyarattai"
     )
 
 
@@ -573,14 +138,16 @@ def ensure_node_deps(silent: bool = False) -> bool:
     npm = shutil.which("npm")
     if not npm:
         if not silent:
-            print("[signal] npm not found — install Node.js")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print("[signal] npm not found — install Node.js")
         return False
     PROJ.mkdir(parents=True, exist_ok=True)
     if not (PROJ / "package.json").exists():
         (PROJ / "package.json").write_text(
             '{"name":"pyarattai","private":true,"version":"0.0.0"}\n')
     if not silent:
-        print(f"[signal] npm install in {PROJ}")
+        if os.environ.get("PYARATTAI_DEBUG"):
+            print(f"[signal] npm install in {PROJ}")
     r = subprocess.run(
         [npm, "install", "--no-audit", "--no-fund", "--silent",
          "--save-exact", *need],
@@ -588,7 +155,8 @@ def ensure_node_deps(silent: bool = False) -> bool:
     )
     if r.returncode != 0:
         if not silent:
-            print(f"[signal] npm install failed:\n{r.stderr[-400:]}")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print(f"[signal] npm install failed:\n{r.stderr[-400:]}")
         return False
     return True
 
@@ -611,7 +179,8 @@ def _run_node(
         env["MY_DEVICE_ID"] = str(my_device_id)
     node = shutil.which("node") or "node"
     return subprocess.run(
-        [node, "--unhandled-rejections=warn", str(script), *args],
+        [node, "--no-warnings", "--unhandled-rejections=warn",
+         str(script), *args],
         input=json.dumps(stdin) if stdin is not None else None,
         capture_output=True, text=True, env=env, timeout=timeout,
     )
@@ -769,10 +338,32 @@ class SignalBridge:
         if not data:
             raise ArattaiError("no device bundles for recipients")
 
-        # 2. Encrypt
+        # 2. Decide mode.
+        #   - DM (non group): pairwise Signal, always E2EE.
+        #   - Group with E2EE:1 in addinfo: SenderKeys (group mode).
+        #   - Group without E2EE: plaintext — caller should use
+        #     client.send() instead of this method.
+        mode = "direct"
+        try:
+            ch = client.get_chat(chat_id)
+            if getattr(ch, "is_group", False) and getattr(ch, "is_e2ee", False):
+                mode = "group"
+            elif getattr(ch, "is_group", False) and not getattr(ch, "is_e2ee", False):
+                raise ArattaiError(
+                    f"chat {chat_id} is a non-E2EE group; use "
+                    f"client.send() (plaintext) instead of "
+                    f"SignalBridge.send()"
+                )
+        except ArattaiError:
+            raise
+        except Exception:
+            # get_chat failed — fall back to chid suffix for DMs
+            if not str(chat_id).endswith("-GC"):
+                mode = "direct"
+
         r = _run_node(
-            SEND_JS, str(self.signal_file),
-            stdin={"text": text, "bundles": data},
+            SEND_JS, str(self.signal_file), mode,
+            stdin={"text": text, "bundles": data, "chid": chat_id},
             my_uid=self.uid, my_device_id=str(client.device_id),
         )
         if r.returncode != 0:
@@ -801,6 +392,8 @@ class SignalBridge:
             "notification_text": encrypted["msg"],
             "enc_keys": json.dumps(encrypted["enc_keys"]),
         }
+        if mode == "group" and encrypted.get("sender_key"):
+            body["sender_key"] = json.dumps(encrypted["sender_key"])
         return client.s.request(
             "POST", "/e2ee/sendofficechatmessage.api", base="chat",
             data=body, headers={"X-SID": sid_val},

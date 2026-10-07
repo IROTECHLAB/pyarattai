@@ -1,27 +1,37 @@
+"""Tests for the bot Message wrapper."""
 from __future__ import annotations
 
 from pyarattai.bot import Message
 from pyarattai.models import Message as RawMessage
 
 
-class _FakeBot:
-    def __init__(self) -> None:
+class FakeClient:
+    uid = "me"
+
+    def __init__(self):
         self.sent = []
 
-    class client:  # noqa: N801
-        uid = "me"
-        def send(self, chat_id, text):  # noqa: D401
-            return RawMessage.from_api(
-                {"msg": text, "sender": "me", "chid": chat_id,
-                 "msgid": "1", "msguid": "1-1"}
-            )
+    def send(self, chat_id, text, **_):
+        self.sent.append((chat_id, text))
+        return RawMessage.from_api({
+            "msg": text, "sender": "me",
+            "chid": chat_id, "msgid": "1", "msguid": "1-1",
+        })
+
+
+class FakeBot:
+    def __init__(self):
+        self.client = FakeClient()
 
 
 def _mk(text: str) -> Message:
-    return Message(_FakeBot(), RawMessage.from_api(
-        {"msg": text, "sender": "u", "dname": "D", "msgid": "1",
-         "msguid": "1-1", "chid": "c", "time": 1}
-    ))
+    raw = RawMessage.from_api({
+        "msg": text, "sender": "u", "dname": "D",
+        "msgid": "1", "msguid": "1-1", "chid": "c", "time": 1,
+    })
+    m = Message(FakeBot(), raw)
+    m.chat_id = "c"
+    return m
 
 
 def test_is_command_and_args():
@@ -41,3 +51,9 @@ def test_non_command():
 def test_command_strips_bot_mention():
     m = _mk("/start@mybot")
     assert m.command == "start"
+
+
+def test_reply_plaintext_path():
+    m = _mk("hi")
+    m.reply("pong")
+    assert m._bot.client.sent == [("c", "pong")]

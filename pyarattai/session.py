@@ -207,13 +207,9 @@ class Session:
                     continue
 
             if raw:
-                if not resp.ok:
-                    raise APIError(
-                        f"HTTP {resp.status_code}",
-                        status_code=resp.status_code,
-                        url=url,
-                        payload=resp.text,
-                    )
+                # When raw=True the caller gets the full Response so
+                # they can inspect status/headers/body without the
+                # library swallowing 4xx/5xx.
                 return resp
 
             if not resp.ok:

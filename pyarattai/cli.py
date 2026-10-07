@@ -26,14 +26,30 @@ def _cmd_login(args: argparse.Namespace) -> int:
 
 
 def _cmd_logout(args: argparse.Namespace) -> int:
-    path = os.path.expanduser(args.session or SESSION_FILE)
-    if os.path.exists(path):
-        os.remove(path)
-        print(f"removed {path}")
-    else:
-        print("no session file")
-    return 0
+    """Log out server-side + delete the local session."""
+    from .client import ArattaiClient
+    from .constants import SESSION_FILE
 
+    path = os.path.expanduser(args.session or SESSION_FILE)
+    if not os.path.exists(path):
+        print("no session file — nothing to log out")
+        return 0
+
+    try:
+        c = ArattaiClient.from_session(path)
+        c.logout(delete_session_file=True)
+    except Exception as e:
+        print(f"logout failed: {e}", file=sys.stderr)
+        # Fall back to just removing the file
+        try:
+            os.remove(path)
+            print(f"removed {path} (server logout was skipped)")
+        except FileNotFoundError:
+            pass
+        return 1
+
+    print("logged out")
+    return 0
 
 def _cmd_chats(args: argparse.Namespace) -> int:
     c = ArattaiClient.from_session(args.session or SESSION_FILE)

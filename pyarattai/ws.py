@@ -10,6 +10,8 @@ This module is synchronous — no asyncio. Suitable for use inside
 """
 from __future__ import annotations
 
+import os
+
 import json
 import logging
 import random

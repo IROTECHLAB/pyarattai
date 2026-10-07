@@ -154,6 +154,7 @@ class ArattaiBot:
         db_path: Optional[str] = BOT_DB_FILE,
         watch_chats: Optional[List[str]] = None,
         transport: str = "http",
+        otp_channel: str = "app",
     ) -> None:
         self.phone = phone
         self.session_file = os.path.expanduser(session_file)
@@ -161,7 +162,9 @@ class ArattaiBot:
         self.e2ee_daemon = e2ee_daemon
         self.watch_chats = watch_chats
         self.transport = transport
+        self.otp_channel = otp_channel
         self._ws = None
+        self._seen_msguids = set()
         self._ws_sid = None
         self._running = False
         self.watch_chats = watch_chats
@@ -171,6 +174,19 @@ class ArattaiBot:
         self._db: Optional[sqlite3.Connection] = None
 
         self.client: ArattaiClient = self._boot_client()
+
+        # Auto-register Signal keys if the store is missing — so
+        # users never have to run a CLI step.
+        try:
+            from .signal import SIGNAL_FILE, register_signal_keys
+            import os as _os
+            if not _os.path.exists(str(SIGNAL_FILE)) and self.client.device_id:
+                print("[pyarattai] registering Signal E2EE keys (first run)")
+                register_signal_keys(self.client, int(self.client.device_id))
+                self.client.save_session(self.session_file)
+                print("[pyarattai] Signal keys registered")
+        except Exception as e:
+            print(f"[pyarattai] signal setup skipped: {e}")
 
         self._message_handlers: List[Callable[[Message], None]] = []
         self._reaction_handlers: Dict[Optional[str], List[Callable[[Message, str, str], None]]] = {}
@@ -192,7 +208,8 @@ class ArattaiBot:
                 "No session found and no phone number supplied. "
                 "Pass phone=... to ArattaiBot()."
             )
-        return ArattaiClient.login(self.phone, self.session_file)
+        return ArattaiClient.login(self.phone, self.session_file,
+                                  channel=getattr(self, "otp_channel", "app"))
 
     # ------------------------------------------------------------- decorators
 
@@ -290,14 +307,16 @@ class ArattaiBot:
                 try:
                     handler.handler_fn(msg)
                 except Exception as e:
-                    print(f"[pyarattai] command error: {e!r}")
+                    if os.environ.get("PYARATTAI_DEBUG"):
+                        print(f"[pyarattai] command error: {e!r}")
                     import traceback
                     traceback.print_exc()
         for fn in self._message_handlers:
             try:
                 fn(msg)
             except Exception as e:
-                print(f"[pyarattai] handler error: {e!r}")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print(f"[pyarattai] handler error: {e!r}")
 
     # ------------------------------------------------------------- run loop
 
@@ -310,11 +329,13 @@ class ArattaiBot:
             except RateLimitError as e:
                 # Back off hard: server is throttling this endpoint.
                 wait = 90.0
-                print(f"[pyarattai] THROTTLED; sleeping {wait}s: {e}")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print(f"[pyarattai] THROTTLED; sleeping {wait}s: {e}")
                 time.sleep(wait)
                 continue
             except ArattaiError as e:
-                print(f"[pyarattai] poll error for {c.id}: {e}")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print(f"[pyarattai] poll error for {c.id}: {e}")
                 continue
 
             last_seen = self._last_msguid.get(c.id)
@@ -361,7 +382,8 @@ class ArattaiBot:
                 self._running = False
                 break
             except Exception as e:  # noqa: BLE001
-                print(f"[pyarattai] loop error: {e!r}; retrying in {backoff:.1f}s")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print(f"[pyarattai] loop error: {e!r}; retrying in {backoff:.1f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 continue
@@ -380,7 +402,8 @@ class ArattaiBot:
         def on_sid(sid: str) -> None:
             self.client.session_id = sid
             self._ws_sid = sid
-            print(f"[pyarattai] X-SID captured ({len(sid)} chars)")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print(f"[pyarattai] X-SID captured ({len(sid)} chars)")
             try:
                 import json as _json
                 sf = os.path.expanduser(self.session_file)
@@ -399,12 +422,14 @@ class ArattaiBot:
                 open(sf, "w").write(_json.dumps(blob, indent=2))
                 os.chmod(sf, 0o600)
             except Exception as e:
-                print(f"[pyarattai] failed to persist SID: {e}")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print(f"[pyarattai] failed to persist SID: {e}")
 
         def on_frame(fr: dict) -> None:
             mt = fr.get("mtype")
             if mt == "0":
-                print("[pyarattai] ws handshake OK")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print("[pyarattai] ws handshake OK")
 
         def on_msg(msg: dict) -> None:
             sender = msg.get("sender")
@@ -413,6 +438,19 @@ class ArattaiBot:
             chid = msg.get("chid") or msg.get("chat_id") or ""
             if not chid:
                 return
+
+            # Dedupe — Arattai redelivers frames on reconnect, and
+            # Signal only decrypts a given ciphertext once.
+            body = str(msg.get("msg") or "")
+            msguid = str(msg.get("msguid") or msg.get("msgid") or "")
+            keys = []
+            if body: keys.append("b:" + body)
+            if msguid: keys.append("m:" + msguid)
+            if keys and any(k in self._seen_msguids for k in keys):
+                return
+            self._seen_msguids.update(keys)
+            if len(self._seen_msguids) > 8000:
+                self._seen_msguids = set(list(self._seen_msguids)[-4000:])
 
             # Auto-decrypt E2EE frames before dispatching to handlers.
             meta = msg.get("meta")
@@ -431,10 +469,12 @@ class ArattaiBot:
                     meta = dict(meta)
                     meta["_decrypted"] = True
                     msg["meta"] = meta
-                    print(f"[pyarattai] decrypted msg from "
+                    if os.environ.get("PYARATTAI_DEBUG"):
+                        print(f"[pyarattai] decrypted msg from "
                           f"{msg.get('dname')}: {plaintext[:60]}")
                 except Exception as e:
-                    print(f"[pyarattai] decrypt failed: {e}")
+                    if os.environ.get("PYARATTAI_DEBUG"):
+                        print(f"[pyarattai] decrypt failed: {e}")
 
             payload = dict(msg)
             payload["chid"] = chid
@@ -448,17 +488,20 @@ class ArattaiBot:
             try:
                 self._dispatch(wrapped)
             except Exception as e:
-                print(f"[pyarattai] dispatch error: {e!r}")
+                if os.environ.get("PYARATTAI_DEBUG"):
+                    print(f"[pyarattai] dispatch error: {e!r}")
         ws.on_sid(on_sid)
         ws.on_frame(on_frame)
         ws.on_message(on_msg)
 
-        print("[pyarattai] starting WebSocket transport")
+        if os.environ.get("PYARATTAI_DEBUG"):
+            print("[pyarattai] starting WebSocket transport")
         ws.start(blocking=False)
         self._running = True
 
         if single:
-            print("[pyarattai] single-shot: 5s listening")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print("[pyarattai] single-shot: 5s listening")
             time.sleep(5.0)
             ws.stop()
             self._running = False
@@ -468,13 +511,31 @@ class ArattaiBot:
             while self._running:
                 time.sleep(1.0)
                 if ws._thread is not None and not ws._thread.is_alive():
-                    print("[pyarattai] ws thread died; exiting")
+                    if os.environ.get("PYARATTAI_DEBUG"):
+                        print("[pyarattai] ws thread died; exiting")
                     break
         except KeyboardInterrupt:
             pass
         finally:
             ws.stop()
             self._running = False
+
+    def typing(self, chat_id: str, idle: bool = False) -> None:
+        """Send a typing indicator using the current WS-issued SID.
+
+        Safe to call from any handler::
+
+            @bot.on_message()
+            def handle(msg):
+                bot.typing(msg.chat_id)
+                ...
+                msg.reply("done")
+        """
+        try:
+            self.client.session_id = self._ws_sid or self.client.session_id
+            self.client.typing(chat_id, idle=idle)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         """Stop the loop (and WS if running)."""

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from .auth import Auth
 from .constants import SESSION_FILE
-from .errors import AuthError
+from .errors import ArattaiError, AuthError
 from .models import Chat, Message
 from .signal import SignalBridge
 from .session import Session
@@ -30,6 +30,12 @@ class ArattaiClient:
         self.registration_id: Optional[str] = blob.get("registration_id")
         self.session_id: Optional[str] = blob.get("session_id")
 
+        # Per-chat E2EE decision cache. Populated lazily: first send to
+        # a chat probes the plaintext endpoint, and if the server
+        # rejects it as E2EE we cache the answer and route E2EE from
+        # then on. Key = chat_id, value = True (e2ee) / False (plain).
+        self._e2ee_chats: Dict[str, bool] = {}
+
         # Expose device identity to Session.request so every chat call
         # carries X-Device-Id / X-Registration-Id (matches reference).
         self.s._device_id = self.device_id
@@ -45,40 +51,122 @@ class ArattaiClient:
         return cls(s, blob)
 
     @classmethod
-    def login(cls, phone: str, session_file: str = SESSION_FILE) -> "ArattaiClient":
-        """Perform interactive OTP login and persist the session."""
+    def login(cls, phone: str, session_file: str = SESSION_FILE,
+              channel: str = "app") -> "ArattaiClient":
+        """Interactive OTP login.
+
+        After a successful OTP, this also:
+
+        * establishes the chat session
+        * mints the WMS token (x-tkp-token)
+        * fetches uid / device info from /webclientsync.do
+        * **auto-registers Signal E2EE keys** if none exist yet
+
+        So callers get a fully working client from a single call::
+
+            client = ArattaiClient.login("91-XXXXXXXXXX")
+
+        Args:
+            phone: phone number as registered (e.g. ``91-XXXXXXXXXX``).
+            session_file: where to store the session JSON.
+            channel: OTP delivery channel — ``"app"`` (default),
+                ``"sms"``, or ``"auto"``.
+
+        Commands at the OTP prompt: digits, ``resend``, ``sms``, ``app``.
+        """
         s = Session()
         a = Auth(s)
         a.start()
         a.lookup(phone)
-        a.send_otp()
-        print(f"OTP sent to {a.r_mobile or a.e_mobile}")
-        code = input("Enter 6-digit OTP: ").strip()
-        a.verify_otp(code)
-        a.mobile = phone
 
-        # Do the chat handshake, mint x-tkp-token, then pull uid and
-        # (if present) e2ee_device_id from /webclientsync.do before
-        # saving — otherwise the file ends up with uid=None.
+        def _send(ch: str) -> bool:
+            try:
+                a.send_otp(channel=ch)
+                if ch == "sms":
+                    print(f"SMS OTP sent to {a.r_mobile or a.e_mobile}")
+                else:
+                    print(f"App OTP sent to {a.r_mobile or a.e_mobile} "
+                          f"(check the Arattai app)")
+                return True
+            except Exception as e:
+                print(f"{ch} send failed: {e}")
+                return False
+
+        _send(channel)
+        current_channel = channel
+
+        for _ in range(50):
+            try:
+                line = input(
+                    "Enter OTP  ('resend' = new code, "
+                    "'sms'/'app' = switch channel): "
+                ).strip()
+            except EOFError:
+                raise
+            if not line:
+                continue
+            low = line.lower()
+            if low == "resend":
+                _send(current_channel)
+                continue
+            if low in ("sms", "app"):
+                current_channel = low
+                _send(current_channel)
+                continue
+
+            resp = a.verify_otp(line)
+            code = ""
+            if isinstance(resp, dict):
+                code = str(resp.get("code") or
+                           resp.get("status_code") or "")
+            if code in ("SI200", "200"):
+                break
+            if code in ("IN105", "500"):
+                print("Wrong code. Try again, or type 'resend'.")
+                continue
+            print(f"Unexpected response ({code}). Try again.")
+        else:
+            raise AuthError("too many OTP attempts")
+
+        a.mobile = phone
         a.establish_chat_session()
         a.mint_x_tkp_token()
         a.fetch_session_meta()
-
-        # If webclientsync did not yield a uid, fall back to the
-        # identifier returned by the accounts lookup (they are the
-        # same value).
         if not a.uid:
             a.uid = a.identifier
-
         a.save(session_file)
         blob = {
             "uid": a.uid, "mobile": a.mobile,
-            "device_id": a.device_id, "registration_id": a.registration_id,
+            "device_id": a.device_id,
+            "registration_id": a.registration_id,
             "session_id": a.session_id,
         }
-        return cls(s, blob)
+        client = cls(s, blob)
 
-    # ------------------------------------------------------------------ helpers
+        # ─── Auto-register Signal E2EE keys on first login ───────────
+        try:
+            from .signal import SIGNAL_FILE, register_signal_keys
+            import os as _os
+            if not _os.path.exists(str(SIGNAL_FILE)):
+                # Assign a device id if we don't have one
+                if not client.device_id:
+                    import secrets as _sec
+                    client.device_id = str(_sec.randbelow(8_000_000)
+                                           + 1_000_000)
+                print("→ registering Signal E2EE keys (one-time setup)")
+                try:
+                    register_signal_keys(client, int(client.device_id))
+                    # Persist the newly assigned device_id + cookies
+                    client.save_session(session_file)
+                    print("→ Signal keys registered")
+                except Exception as e:
+                    print(f"⚠ Signal registration failed: {e}")
+                    print("  (you can retry with: pyarattai signal register)")
+        except Exception as e:
+            # Never break login just because Signal setup hiccupped
+            print(f"⚠ auto Signal setup skipped: {e}")
+
+        return client
 
     def _ts(self) -> int:
         return int(time.time() * 1000)
@@ -184,30 +272,282 @@ class ArattaiClient:
                         "auto-decrypt failed: %s", e)
             msgs.append(msg)
         return msgs
-    def send(self, chat_id: str, text: str) -> Message:
-        """Send a plaintext message."""
+    def send(self, chat_id: str, text: str, *,
+             force_plaintext: bool = False) -> Message:
+        """Send a message, auto-detecting E2EE.
+
+        Strategy (self-tuning):
+
+        1. If we've cached a decision for this chat, use it.
+        2. Otherwise try the plaintext endpoint first.
+        3. If plaintext is rejected (any 4xx), retry via
+           :class:`SignalBridge`. On success, cache ``True``.
+        4. If plaintext succeeds, cache ``False``.
+
+        The server is the source of truth — no guessing about chat
+        types. Works for DMs, groups, channels, saved messages, and
+        anything Arattai adds later.
+        """
+        if force_plaintext:
+            return self._send_plaintext(chat_id, text)
+
+        cached = self._e2ee_chats.get(chat_id)
+        if cached is True:
+            return self._send_e2ee(chat_id, text)
+        if cached is False:
+            return self._send_plaintext(chat_id, text)
+
+        # Unknown → probe by trying plaintext first
+        try:
+            return self._send_plaintext(chat_id, text)
+        except Exception as plain_err:
+            try:
+                msg = self._send_e2ee(chat_id, text)
+                self._remember_e2ee(chat_id, True)
+                return msg
+            except Exception as e2ee_err:
+                raise plain_err from e2ee_err
+
+
+    def _send_plaintext(self, chat_id: str, text: str) -> Message:
+        """Plaintext POST via /sendofficechatmessage.do."""
+        sid = self._require_sid()
         msgid = str(self._ts())
         body = {
             "chid": chat_id,
             "msg": text,
             "msgid": msgid,
-            "sid": self._sid(),
+            "sid": sid,
             "dname": self._dname(),
             "unfurl": "false",
         }
-        data = self.s.request(
-            "POST",
-            "/sendofficechatmessage.do",
-            base="chat",
-            data=body,
-            headers={"X-SID": self._sid()},
-        )
+        try:
+            data = self.s.request(
+                "POST", "/sendofficechatmessage.do", base="chat",
+                data=body, headers={"X-SID": sid},
+            )
+        except Exception:
+            # Let the caller decide
+            raise
         entry = (data or [{}])[0] if isinstance(data, list) else {}
         obj = (entry or {}).get("objString") or {}
         obj.setdefault("msg", text)
         obj.setdefault("msgid", msgid)
         obj.setdefault("chid", chat_id)
+        self._remember_e2ee(chat_id, False)
         return Message.from_api(obj)
+
+    def _send_e2ee(self, chat_id: str, text: str) -> Message:
+        """E2EE POST via SignalBridge."""
+        # Group E2EE requires SenderKeys, which the vendored libsignal
+        # build doesn't expose. Fail with a clear message rather than
+        # a cryptic error from the JS layer.
+        if str(chat_id).endswith("-GC"):
+            try:
+                ch = self.get_chat(chat_id)
+                if getattr(ch, "is_e2ee", False):
+                    raise ArattaiError(
+                        "group E2EE is not supported in this version "
+                        "(requires SenderKeys). Non-E2EE groups work as "
+                        "plaintext. See the README for roadmap."
+                    )
+            except ArattaiError:
+                raise
+            except Exception:
+                pass
+
+        recipient = self._find_recipient(chat_id)
+        if not recipient:
+            raise ArattaiError(
+                f"can't determine recipient for E2EE send to {chat_id}"
+            )
+
+        sid = self._require_sid()
+        from .signal import SignalBridge
+        bridge = SignalBridge(uid=self.uid or "0")
+        bridge.send(self, chat_id, recipient, text, sid=sid)
+        self._remember_e2ee(chat_id, True)
+        return Message.from_api({
+            "msg": text, "msgid": "e2ee-sent",
+            "msguid": "e2ee-sent",
+            "chid": chat_id, "sender": self.uid or "",
+        })
+
+
+    def _find_recipient(self, chat_id: str) -> Optional[str]:
+        """Extract the peer uid for a DM / group chat.
+
+        Arattai returns ``recipants`` in several shapes:
+          * ``"20004081014,20031897759"`` — comma list
+          * ``'[{"dname":"...","zuid":"..."}]'`` — JSON array of dicts
+          * ``'["20004081014","20031897759"]'`` — JSON array of uids
+
+        For DMs we return the single uid that isn't ours.
+        """
+        import json as _json
+
+        try:
+            ch = self.get_chat(chat_id)
+        except Exception:
+            return self.uid
+
+        raw = ch.raw or {}
+        recipants_raw = raw.get("recipants")
+
+        uids = []
+
+        def _collect(item):
+            if isinstance(item, dict):
+                for k in ("zuid", "id", "uid", "user_id"):
+                    v = item.get(k)
+                    if v:
+                        uids.append(str(v))
+                        return
+            elif isinstance(item, (str, int)):
+                uids.append(str(item))
+
+        if isinstance(recipants_raw, list):
+            for item in recipants_raw:
+                _collect(item)
+        elif recipants_raw is not None:
+            tv = str(recipants_raw).strip()
+            parsed = None
+            if tv.startswith("[") or tv.startswith("{"):
+                try:
+                    parsed = _json.loads(tv)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    _collect(item)
+            elif isinstance(parsed, dict):
+                _collect(parsed)
+            else:
+                for part in tv.split(","):
+                    part = part.strip()
+                    if part:
+                        uids.append(part)
+
+        # Fallback to the users field
+        if not uids:
+            users_raw = raw.get("users")
+            if isinstance(users_raw, str) and users_raw.strip().startswith("["):
+                try:
+                    for item in _json.loads(users_raw):
+                        _collect(item)
+                except Exception:
+                    pass
+            elif isinstance(users_raw, list):
+                for item in users_raw:
+                    _collect(item)
+
+        # Drop empties and ourselves
+        uids = [u for u in uids if u and u != self.uid]
+
+        if not uids:
+            return self.uid
+        return uids[0]
+
+
+    def _is_e2ee_chat(self, chat_id: str) -> bool:
+        """True if we've cached this chat as E2EE."""
+        return bool(self._e2ee_chats.get(chat_id, False))
+
+    def _remember_e2ee(self, chat_id: str, value: bool) -> None:
+        """Cache the E2EE decision for a chat."""
+        self._e2ee_chats[chat_id] = bool(value)
+
+    @staticmethod
+    def _looks_e2ee_only_error(payload) -> bool:
+        """True if the server said "this chat requires E2EE".
+
+        The plaintext send endpoint 400s with a body mentioning
+        ``e2ee`` / ``encrypt`` when the chat only accepts encrypted
+        sends.  This lets us auto-retry via SignalBridge.
+        """
+        if payload is None:
+            return False
+        text = str(payload).lower()
+        if "e2ee" in text or "encrypt" in text:
+            return True
+        if isinstance(payload, dict):
+            code = str(payload.get("code") or "").lower()
+            if code in ("request_not_allowed", "e2ee_required",
+                        "not_allowed"):
+                return True
+            msg = str(payload.get("message") or "").lower()
+            if "e2ee" in msg or "encrypt" in msg:
+                return True
+        if isinstance(payload, list) and payload:
+            first = payload[0]
+            if isinstance(first, dict):
+                inner = str(first).lower()
+                if "e2ee" in inner or "encrypt" in inner:
+                    return True
+        return False
+
+    def _require_sid(self) -> str:
+        """Return a fresh WS-issued SID or raise.
+
+        Use this in every send/status/edit endpoint body and header.
+        """
+        sid = self._fresh_ws_sid()
+        if not sid:
+            raise ArattaiError(
+                "could not obtain X-SID from WebSocket; "
+                "check network and try again"
+            )
+        return sid
+
+    def _fresh_ws_sid(self, timeout: float = 15.0) -> Optional[str]:
+        """Open a WebSocket, capture the WS-issued X-SID, close.
+
+        Every send endpoint (``/sendofficechatmessage.do``,
+        ``/e2ee/sendofficechatmessage.api``, ``/sendstatus.do``,
+        ``/propagatemsgseen.do``) requires the SID the server issues
+        in the ``mtype: 0`` frame of a WS handshake. The value stored
+        in ``session.json`` is the x-tkp-token and is NOT accepted.
+
+        Always returns a fresh SID — no caching — so it stays valid
+        even if the WS session rotates.
+
+        Returns:
+            The SID string, or None if the WS handshake failed
+            within ``timeout`` seconds.
+        """
+        import time as _t
+        try:
+            from .ws import WSClient
+        except Exception as e:
+            import logging
+            logging.getLogger("pyarattai").warning(
+                "WSClient unavailable: %s", e
+            )
+            return None
+
+        box: dict = {}
+        ws = WSClient(
+            self.s,
+            uid=self.uid or "0",
+            dname=self._dname(),
+        )
+        ws.on_sid(lambda sid: box.update(sid=sid))
+        ws.start(blocking=False)
+
+        deadline = _t.time() + timeout
+        while _t.time() < deadline:
+            if box.get("sid"):
+                break
+            _t.sleep(0.25)
+
+        ws.stop()
+        sid = box.get("sid")
+        if not sid:
+            import logging
+            logging.getLogger("pyarattai").warning(
+                "no X-SID captured within %.1fs", timeout
+            )
+        return sid
 
     def edit(self, chat_id: str, msguid: str, text: str) -> Any:
         """Edit an existing message."""
@@ -226,7 +566,7 @@ class ArattaiClient:
             "/sendofficechatmessage.do",
             base="chat",
             data=body,
-            headers={"X-SID": self._sid()},
+            headers={"X-SID": self._require_sid()},
         )
 
     def delete(self, chat_id: str, msguid: str) -> None:
@@ -276,17 +616,31 @@ class ArattaiClient:
     # ------------------------------------------------------------------ status
 
     def typing(self, chat_id: str, idle: bool = False) -> Any:
-        """Send typing (or idle) status."""
+        """Send a typing (or idle) status to a chat.
+
+        Always grabs a fresh WS-issued X-SID — the stored
+        ``session_id`` from ``session.json`` is the x-tkp-token and is
+        rejected by ``/sendstatus.do``.
+        """
         from .constants import STATUS_IDLE, STATUS_TYPING
 
+        sid = self._require_sid()
         body = {
             "userid": self.uid or "",
             "chid": chat_id,
             "status": STATUS_IDLE if idle else STATUS_TYPING,
-            "sid": self._sid(),
+            "sid": sid,
             "dname": self._dname(),
         }
-        return self.s.request("POST", "/sendstatus.do", base="chat", data=body)
+        headers = {
+            "Content-Type":
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-SID": sid,
+        }
+        return self.s.request(
+            "POST", "/sendstatus.do", base="chat",
+            data=body, headers=headers,
+        )
 
     # ------------------------------------------------------------------ groups
 
@@ -304,7 +658,7 @@ class ArattaiClient:
             "/addmember.do",
             base="chat",
             json={"invited_users": uids},
-            headers={"X-SID": self._sid()},
+            headers={"X-SID": self._require_sid()},
         )
 
     def remove_member(self, chat_id: str, uids: List[str]) -> Any:
@@ -314,7 +668,7 @@ class ArattaiClient:
             "/deletemember.do",
             base="chat",
             json={"removed_users": uids},
-            headers={"X-SID": self._sid()},
+            headers={"X-SID": self._require_sid()},
         )
 
     def join_chat(self, chat_id: str) -> Any:
@@ -457,6 +811,43 @@ class ArattaiClient:
         )
 
     # ------------------------------------------------------------------ paths
+
+    def logout(self, delete_session_file: bool = True) -> None:
+        """Log out server-side and (optionally) remove local state.
+
+        Hits ``GET /logout.sas`` which returns a 302 chain ending on
+        ``/login.jsp`` — after the chain, the IAM cookies
+        (``__Secure-iamsdt``, ``_iamadt``, ``_iambdt``, ``x-tkp-token``)
+        are cleared and the linked-device session is terminated on the
+        server. The remaining CSRF scaffolding cookies
+        (``CT_CSRF_TOKEN``, ``JSESSIONID``) are harmless.
+
+        Args:
+            delete_session_file: also remove ``~/.pyarattai/session.json``
+                and ``~/.pyarattai/signal-storage.json`` so a subsequent
+                login starts completely fresh.
+        """
+        try:
+            r = self.s.request(
+                "GET", "/logout.sas", base="chat",
+                raw=True, allow_redirects=True, timeout=20,
+            )
+            ok = r.status_code in (200, 401) and "login" in r.url
+            print(f"[logout] server {'OK' if ok else 'unexpected'} "
+                  f"(HTTP {r.status_code})")
+        except Exception as e:
+            print(f"[logout] request failed: {e}")
+
+        if delete_session_file:
+            import os as _os
+            from .constants import SESSION_FILE as _SF
+            from .signal import SIGNAL_FILE as _SIG
+            for f in (_os.path.expanduser(_SF), str(_SIG)):
+                try:
+                    _os.remove(f)
+                    print(f"[logout] removed {f}")
+                except FileNotFoundError:
+                    pass
 
     @staticmethod
     def default_session_path() -> str:

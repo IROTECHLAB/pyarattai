@@ -86,9 +86,11 @@ class Auth:
             },
             timeout=20,
         )
-        print(f"[auth.start] raw GET -> {r.status_code}")
+        if os.environ.get("PYARATTAI_DEBUG"):
+            print(f"[auth.start] raw GET -> {r.status_code}")
         if r.status_code != 200:
-            print(f"[auth.start] body: {r.text[:400]}")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print(f"[auth.start] body: {r.text[:400]}")
             raise AuthError(f"signin {r.status_code}")
 
         # Copy cookies + headers into our main session so the rest of the
@@ -149,45 +151,107 @@ class Auth:
             raise AuthError(f"Lookup failed: {data}")
         return data
 
-    def send_otp(self) -> Any:
-        """Trigger the OTP SMS."""
+    def send_otp(self, channel: str = "app") -> Dict[str, Any]:
+        """Request an OTP.
+
+        Args:
+            channel: Which delivery channel to use.
+                - ``"app"`` — Arattai app notification via
+                  ``POST /signin/v2/primary/{id}/arotp/{e_mobile}``
+                  with ``{"arotpauth": {"mode": "MOBILE"}}``.
+                - ``"sms"`` — SMS via
+                  ``POST /signin/v2/primary/{id}/otp/{e_mobile}``
+                  with ``{"otpauth": {"is_resend": True}}``.
+                - ``"auto"`` — Try app first, fall back to SMS.
+
+        Returns:
+            The server response as a dict.
+
+        Raises:
+            AuthError if both paths fail.
+        """
         if not (self.identifier and self.digest and self.e_mobile):
             raise AuthError("Call lookup() first")
-        ts = int(time.time() * 1000)
-        url = (
-            f"/signin/v2/primary/{self.identifier}/arotp/{self.e_mobile}?"
-            + _OTP_QUERY.format(digest=self.digest, ts=ts)
-        )
-        return self.s.request(
-            "POST",
-            url,
-            base="auth",
-            json={"arotpauth": {"mode": "MOBILE"}},
-            headers={"Content-Type": "application/json;charset=UTF-8"},
-        )
 
-    # ------------------------------------------------------------------ step 4
+        def _app():
+            ts = int(time.time() * 1000)
+            url = (
+                f"/signin/v2/primary/{self.identifier}/arotp/"
+                f"{self.e_mobile}?"
+                + _OTP_QUERY.format(digest=self.digest, ts=ts)
+            )
+            return self.s.request(
+                "POST", url, base="auth",
+                json={"arotpauth": {"mode": "MOBILE"}},
+                headers={"Content-Type":
+                         "application/json;charset=UTF-8"},
+            )
 
-    def verify_otp(self, code: str, is_resend: bool = False) -> Any:
-        """Submit the OTP code (or request a resend)."""
+        def _sms():
+            ts = int(time.time() * 1000)
+            url = (
+                f"/signin/v2/primary/{self.identifier}/otp/"
+                f"{self.e_mobile}?"
+                + _OTP_QUERY.format(digest=self.digest, ts=ts)
+            )
+            return self.s.request(
+                "POST", url, base="auth",
+                json={"otpauth": {"is_resend": True, "mode": "MOBILE"}},
+                headers={"Content-Type":
+                         "application/json;charset=UTF-8"},
+            )
+
+        channel = (channel or "auto").lower()
+        errors = []
+        if channel in ("app", "auto"):
+            try:
+                return _app()
+            except Exception as e:
+                errors.append(f"app: {e}")
+                if channel == "app":
+                    raise
+        if channel in ("sms", "auto"):
+            try:
+                return _sms()
+            except Exception as e:
+                errors.append(f"sms: {e}")
+        raise AuthError("OTP send failed: " + " | ".join(errors) or
+                        "no channel tried")
+
+    def verify_otp(self, code: str) -> Dict[str, Any]:
+        """Submit an OTP code.
+
+        Works for both app-delivered (arotp) and SMS-delivered (otp)
+        codes — the server accepts them on the same endpoint.
+
+        Returns the server response dict. On a bad code (IN105) or any
+        HTTP error, returns ``{"code": "<ERR>", "message": "..."}``
+        instead of raising, so callers can prompt for a retry.
+        """
         if not (self.identifier and self.digest and self.e_mobile):
             raise AuthError("Call lookup() first")
+
         ts = int(time.time() * 1000)
         url = (
             f"/signin/v2/primary/{self.identifier}/otp/{self.e_mobile}?"
             + _OTP_QUERY.format(digest=self.digest, ts=ts)
         )
-        payload = {"otpauth": {"code": code, "is_resend": is_resend, "mode": "MOBILE"}}
-        if is_resend:
-            payload = {"otpauth": {"is_resend": True, "mode": "MOBILE"}}
+        try:
             return self.s.request(
-                "POST", url, base="auth", json=payload,
-                headers={"Content-Type": "application/json;charset=UTF-8"},
+                "PUT",
+                url,
+                base="auth",
+                json={"otpauth": {"code": code,
+                                  "is_resend": False,
+                                  "mode": "MOBILE"}},
+                headers={"Content-Type":
+                         "application/json;charset=UTF-8"},
             )
-        return self.s.request(
-            "PUT", url, base="auth", json=payload,
-            headers={"Content-Type": "application/json;charset=UTF-8"},
-        )
+        except Exception as e:
+            payload = getattr(e, "payload", None)
+            if isinstance(payload, dict):
+                return payload
+            return {"code": "VERIFY_ERROR", "message": str(e)}
 
     # ------------------------------------------------------------------ post-login
 
@@ -256,15 +320,18 @@ class Auth:
                 },
             )
         except Exception as e:  # noqa: BLE001
-            print(f"[auth.mint] request failed: {e}")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print(f"[auth.mint] request failed: {e}")
             return None
 
         tok = r.cookies.get("x-tkp-token")
         if tok:
             self.session_id = self.session_id or tok
-            print(f"[auth.mint] x-tkp-token = {tok[:40]}...")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print(f"[auth.mint] x-tkp-token = {tok[:40]}...")
         else:
-            print(f"[auth.mint] no x-tkp-token in Set-Cookie; status={r.status_code}")
+            if os.environ.get("PYARATTAI_DEBUG"):
+                print(f"[auth.mint] no x-tkp-token in Set-Cookie; status={r.status_code}")
         return tok
 
     def fetch_session_meta(self) -> None:

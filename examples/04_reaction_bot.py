@@ -1,16 +1,16 @@
-"""React 👍 to every incoming message in a specific chat."""
+"""React 👍 to every incoming message in one chat."""
 from pyarattai import ArattaiBot
 
-TARGET_CHAT = "your-chat-id-here"
+TARGET_CHAT = "your-chat-id-here"   # replace
 
-bot = ArattaiBot("91XXXXXXXXXX")
+bot = ArattaiBot("91-XXXXXXXXXX")
 
 
 @bot.on_message(filters=lambda m: m.chat_id == TARGET_CHAT)
 def react(msg):
     try:
         msg.react("👍")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print("react failed:", e)
 
 
